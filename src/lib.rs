@@ -1,23 +1,59 @@
 use ct_merkle::{
-    batch_inclusion::BatchInclusionProof, inclusion::InclusionProof, CanonicalSerialize,
-    CtMerkleTree, RootHash, SimpleWriter,
+    batch_inclusion::BatchInclusionProof, CanonicalSerialize, CtMerkleTree, RootHash, SimpleWriter,
 };
 use digest::Digest;
 use rand_core::{CryptoRng, RngCore};
+use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 type Label = [u8; 16];
 type Randomness = [u8; 16];
 
+/// Contains a label and a random string used for hiding in the commitment
+#[derive(Copy, Clone, SerdeSerialize, SerdeDeserialize)]
+struct LabelAndRandomness {
+    label: Label,
+    randomness: Randomness,
+}
+
 //The UserLabel of bit `b` at index `i` appears in this data structure at index `2i + b`.
 /// The Merkle tree containing all the Notary's labels.
+#[derive(SerdeSerialize, SerdeDeserialize)]
 pub struct NotaryLabels<H: Digest>(CtMerkleTree<H, Label>);
 /// The Merkle tree containing all the User's labels.
+#[derive(SerdeSerialize, SerdeDeserialize)]
 pub struct UserLabels<H: Digest>(CtMerkleTree<H, LabelAndRandomness>);
 
 /// The root hash of the Notary's label tree
 pub struct NotaryLabelRoot<H: Digest>(RootHash<H>);
 /// The root hash of the User's label tree
 pub struct UserLabelRoot<H: Digest>(RootHash<H>);
+
+/// A batch proof revealing a number of plaintext bits
+#[derive(Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct BatchBitProof<H: Digest> {
+    /// The labels and blinds corresponding to the revealed bits
+    active_labels: Vec<LabelAndRandomness>,
+    ///  The batch proof of membership of the labels+blinds in the user's Merkle tree
+    active_labels_proof: BatchInclusionProof<H>,
+    ///  The batch proof of membership of the labels in the Notary's Merkle tree
+    full_labels_proof: BatchInclusionProof<H>,
+}
+
+/// Contains all the info about the User's plaintext
+#[derive(SerdeSerialize, SerdeDeserialize)]
+pub struct Plaintext<H: Digest> {
+    /// The plaintext bitstring
+    pub bits: Vec<bool>,
+    /// The Merkle tree of the plaintext
+    pub label_tree: UserLabels<H>,
+}
+
+impl CanonicalSerialize for LabelAndRandomness {
+    fn serialize<W: SimpleWriter>(&self, mut w: W) {
+        CanonicalSerialize::serialize(&self.label, &mut w);
+        CanonicalSerialize::serialize(&self.randomness, &mut w);
+    }
+}
 
 impl<H: Digest> NotaryLabels<H> {
     /// Get the Merkle root of the Notary label tree
@@ -33,29 +69,7 @@ impl<H: Digest> UserLabels<H> {
     }
 }
 
-/// Contains a label and a random string used for hiding in the commitment
-#[derive(Copy, Clone)]
-struct LabelAndRandomness {
-    label: Label,
-    randomness: Randomness,
-}
-
-impl CanonicalSerialize for LabelAndRandomness {
-    fn serialize<W: SimpleWriter>(&self, mut w: W) {
-        self.label.serialize(&mut w);
-        self.randomness.serialize(&mut w);
-    }
-}
-
-/// Contains all the info about the User's plaintext
-pub struct Plaintext<H: Digest> {
-    /// The plaintext bitstring
-    pub bits: Vec<bool>,
-    /// The Merkle tree of the plaintext
-    pub label_tree: UserLabels<H>,
-}
-
-/// Commits to the given label set by making a tree out of the (blinded) labels. This is done by
+/// Commits to the active label set by making a tree out of the (blinded) labels. This is done by
 /// the User before she learns the decoding of her plaintext.
 pub fn user_commit<H, R>(mut rng: R, labels: &[Label]) -> UserLabels<H>
 where
@@ -74,7 +88,7 @@ where
     UserLabels(tree)
 }
 
-/// Commits to the given label set by making a tree out of the  labels. The labels must be ordered
+/// Commits to the full label set by making a tree out of the  labels. The labels must be ordered
 /// as `[label1bit0, label1bit1, label2bit0, label2bit1, ...]`
 pub fn notary_commit<H>(labels: &[Label]) -> NotaryLabels<H>
 where
@@ -88,34 +102,8 @@ where
     NotaryLabels(tree)
 }
 
-/// A proof revealing a plaintext bit
-pub struct BitProof<H: Digest> {
-    active_label: LabelAndRandomness,
-    active_label_proof: InclusionProof<H>,
-    full_label_proof: InclusionProof<H>,
-}
-
-/// A batch proof revealing a number of plaintext bits
-pub struct BatchBitProof<H: Digest> {
-    active_labels: Vec<LabelAndRandomness>,
-    active_labels_proof: BatchInclusionProof<H>,
-    full_labels_proof: BatchInclusionProof<H>,
-}
-
 impl<H: Digest> Plaintext<H> {
-    pub fn prove_bit(&self, idx: usize, all_labels: &NotaryLabels<H>) -> BitProof<H> {
-        let bit = *self.bits.get(idx).unwrap();
-        let active_label = *self.label_tree.0.get(idx).unwrap();
-        let active_label_proof = self.label_tree.0.prove_inclusion(idx);
-        let full_label_proof = all_labels.0.prove_inclusion(2 * idx + (bit as usize));
-
-        BitProof {
-            active_label,
-            active_label_proof,
-            full_label_proof,
-        }
-    }
-
+    /// Proves that the given range of bits occurs in this `Plaintext`.
     pub fn prove_bits(
         &self,
         range: core::ops::RangeInclusive<usize>,
@@ -123,16 +111,22 @@ impl<H: Digest> Plaintext<H> {
     ) -> BatchBitProof<H> {
         let active_idxs: Vec<usize> = range.clone().collect();
         let bits = self.bits[range.clone()].to_vec();
+
+        // Get the corresponding indices into the full label set. Recall label i bit b occurs in
+        // the full set at index 2i + b
         let full_idxs: Vec<usize> = active_idxs
             .iter()
             .zip(bits.iter())
             .map(|(idx, bit)| 2 * idx + (*bit as usize))
             .collect();
 
+        // Now get the (blinded) active labels from the plaintext Merkle tree
         let active_labels = range
             .map(|i| self.label_tree.0.get(i).unwrap())
             .cloned()
             .collect();
+
+        // Compute the proofs of inclusion for the user's Merkle tree and the Notary's Merkle tree
         let active_labels_proof = self.label_tree.0.prove_batch_inclusion(&active_idxs);
         let full_labels_proof = all_labels.0.prove_batch_inclusion(&full_idxs);
 
@@ -142,33 +136,6 @@ impl<H: Digest> Plaintext<H> {
             full_labels_proof,
         }
     }
-}
-
-/// Verifies that `bit` occurs in the plaintext committed by `user_root` in position `idx`.
-pub fn verify_bit<H: Digest>(
-    bit: bool,
-    idx: usize,
-    user_root: &UserLabelRoot<H>,
-    notary_root: &NotaryLabelRoot<H>,
-    proof: &BitProof<H>,
-) -> Result<(), ()> {
-    // First check the active label's presence in the user label tree
-    user_root
-        .0
-        .verify_inclusion(&proof.active_label, idx, &proof.active_label_proof)
-        .map_err(|_| ())?;
-
-    // Then check the label's presence in the notary label tree
-    notary_root
-        .0
-        .verify_inclusion(
-            &proof.active_label.label,
-            idx * 2 + (bit as usize),
-            &proof.full_label_proof,
-        )
-        .map_err(|_| ())?;
-
-    Ok(())
 }
 
 /// Verifies that `bits` occurs in the plaintext committed by `user_root` in the indices contained
@@ -256,10 +223,10 @@ mod tests {
 
         let bit_idx = rng.gen_range(0..plaintext_bitlen - subslice_size);
 
-        // Do the proofs naively
+        // Do the proofs naively, one bit at a time
         let start = std::time::Instant::now();
-        let proofs: Vec<BitProof<H>> = (bit_idx..(bit_idx + subslice_size))
-            .map(|i| pt.prove_bit(i, &notary_tree))
+        let proofs: Vec<BatchBitProof<H>> = (bit_idx..(bit_idx + subslice_size))
+            .map(|i| pt.prove_bits(i..=i, &notary_tree))
             .collect();
         let naive_proof_time = start.elapsed().as_micros();
 
@@ -271,10 +238,10 @@ mod tests {
         let batch_proof = pt.prove_bits(range.clone(), &notary_tree);
         let batch_proof_time = start.elapsed().as_micros();
 
-        // Verify the naive proofs
+        // Verify the naive proofs, one bit at a time
         let start = std::time::Instant::now();
         range.clone().zip(proofs.iter()).for_each(|(i, proof)| {
-            verify_bit(plaintext[i], i, &user_root, &notary_root, &proof).unwrap()
+            verify_bits(&plaintext[i..=i], i..=i, &user_root, &notary_root, &proof).unwrap()
         });
         let naive_verif_time = start.elapsed().as_micros();
 
@@ -294,28 +261,8 @@ mod tests {
         );
         println!(
             "Proof size is {}B / {}B (naive/batched)",
-            2 * proofs.len() * proofs[0].active_label_proof.as_bytes().len(),
+            2 * proofs.len() * proofs[0].active_labels_proof.as_bytes().len(),
             2 * batch_proof.active_labels_proof.as_bytes().len(),
         );
-    }
-
-    // A quick batch merkle tree benchmark using a different library. We really don't need this
-    #[test]
-    fn test_reveal_wintercrypto() {
-        use winter_crypto::{Hasher, MerkleTree};
-        type H = winter_crypto::hashers::Blake3_256<winter_math::fields::f128::BaseElement>;
-
-        let placeholder = H::hash(b"hello");
-        let leaves = vec![placeholder; 1 << 15];
-        let tree = MerkleTree::<H>::new(leaves).unwrap();
-
-        let indices: Vec<usize> = (100..200).collect();
-
-        let start = std::time::Instant::now();
-        let proof = tree.prove_batch(&indices).unwrap();
-        let proof_time = start.elapsed().as_nanos();
-
-        println!("Proving 100 of 2^15 bits: {proof_time}us");
-        println!("Proof size is {}", proof.serialize_nodes().len());
     }
 }
