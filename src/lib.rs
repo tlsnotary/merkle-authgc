@@ -17,10 +17,10 @@ struct LabelAndRandomness {
 
 //The UserLabel of bit `b` at index `i` appears in this data structure at index `2i + b`.
 /// The Merkle tree containing all the Notary's labels.
-#[derive(SerdeSerialize, SerdeDeserialize)]
+#[derive(Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct NotaryLabels<H: Digest>(CtMerkleTree<H, Label>);
 /// The Merkle tree containing all the User's labels.
-#[derive(SerdeSerialize, SerdeDeserialize)]
+#[derive(Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct UserLabels<H: Digest>(CtMerkleTree<H, LabelAndRandomness>);
 
 /// The root hash of the Notary's label tree
@@ -40,7 +40,7 @@ pub struct BatchBitProof<H: Digest> {
 }
 
 /// Contains all the info about the User's plaintext
-#[derive(SerdeSerialize, SerdeDeserialize)]
+#[derive(Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct Plaintext<H: Digest> {
     /// The plaintext bitstring
     pub bits: Vec<bool>,
@@ -104,6 +104,8 @@ where
 
 impl<H: Digest> Plaintext<H> {
     /// Proves that the given range of bits occurs in this `Plaintext`.
+    ///
+    /// Panics if `range.is_empty()` or if `range.end >= self.len()`
     pub fn prove_bits(
         &self,
         range: core::ops::RangeInclusive<usize>,
@@ -140,6 +142,8 @@ impl<H: Digest> Plaintext<H> {
 
 /// Verifies that `bits` occurs in the plaintext committed by `user_root` in the indices contained
 /// in `range`.
+///
+/// Panics if `range.len() != bits.len()` or if `range.end >= self.len()`
 pub fn verify_bits<H: Digest>(
     bits: &[bool],
     range: core::ops::RangeInclusive<usize>,
@@ -183,21 +187,20 @@ mod tests {
 
     type H = Blake2s256;
 
-    #[test]
-    fn test_subslice_reveal() {
+    const LOG_PLAINTEXT_BITLEN: usize = 15;
+    const PLAINTEXT_BITLEN: usize = 1 << LOG_PLAINTEXT_BITLEN;
+
+    fn setup() -> (Plaintext<H>, NotaryLabels<H>) {
         let mut rng = thread_rng();
-        let log_plaintext_bitlen = 15;
-        let plaintext_bitlen = 1 << log_plaintext_bitlen;
-        let subslice_size = 100;
 
         // Generate random labels
         let all_labels: Vec<Label> = core::iter::repeat_with(|| rng.gen::<Label>())
-            .take(2 * plaintext_bitlen)
+            .take(2 * PLAINTEXT_BITLEN)
             .collect();
 
         // Pick a random plaintext
         let plaintext: Vec<bool> = core::iter::repeat_with(|| rng.gen::<bool>())
-            .take(plaintext_bitlen)
+            .take(PLAINTEXT_BITLEN)
             .collect();
 
         // Extract the plaintext labels from the set of all labels
@@ -211,17 +214,29 @@ mod tests {
         // Commit to everything
         let user_tree = user_commit::<H, _>(&mut rng, &plaintext_labels);
         let notary_tree = notary_commit::<H>(&all_labels);
-        let user_root = user_tree.root();
-        let notary_root = notary_tree.root();
 
         let pt = Plaintext {
             label_tree: user_tree,
             bits: plaintext.clone(),
         };
 
-        // Prove a randomly bit slice
+        (pt, notary_tree)
+    }
 
-        let bit_idx = rng.gen_range(0..plaintext_bitlen - subslice_size);
+    // Checks that an honestly generated proof verifies successfully
+    #[test]
+    fn test_subslice_proof_correctness() {
+        let mut rng = thread_rng();
+        let subslice_size = 100;
+
+        // Do setup
+        let (pt, notary_tree) = setup();
+        let user_root = pt.label_tree.root();
+        let notary_root = notary_tree.root();
+
+        // Prove a randomly chosen bit slice
+
+        let bit_idx = rng.gen_range(0..pt.bits.len() - subslice_size);
 
         // Do the proofs naively, one bit at a time
         let start = std::time::Instant::now();
@@ -241,28 +256,86 @@ mod tests {
         // Verify the naive proofs, one bit at a time
         let start = std::time::Instant::now();
         range.clone().zip(proofs.iter()).for_each(|(i, proof)| {
-            verify_bits(&plaintext[i..=i], i..=i, &user_root, &notary_root, &proof).unwrap()
+            verify_bits(&pt.bits[i..=i], i..=i, &user_root, &notary_root, &proof).unwrap()
         });
         let naive_verif_time = start.elapsed().as_micros();
 
         // Verify the batch proof
-        let bits = &plaintext[range.clone()];
+        let bits = &pt.bits[range.clone()];
         let start = std::time::Instant::now();
         verify_bits(&bits, range, &user_root, &notary_root, &batch_proof).unwrap();
         let batch_verif_time = start.elapsed().as_micros();
 
         println!(
             "Naively revealing {} of 2^{} bits took: {}us / {}us (proof/verif)",
-            subslice_size, log_plaintext_bitlen, naive_proof_time, naive_verif_time
+            subslice_size, LOG_PLAINTEXT_BITLEN, naive_proof_time, naive_verif_time
         );
         println!(
             "Batched revealing {} of 2^{} bits took: {}us / {}us (proof/verif)",
-            subslice_size, log_plaintext_bitlen, batch_proof_time, batch_verif_time
+            subslice_size, LOG_PLAINTEXT_BITLEN, batch_proof_time, batch_verif_time
         );
         println!(
             "Proof size is {}B / {}B (naive/batched)",
             2 * proofs.len() * proofs[0].active_labels_proof.as_bytes().len(),
             2 * batch_proof.active_labels_proof.as_bytes().len(),
         );
+    }
+
+    // Checks that mutating the proofs or the plaintext causes verification to fail
+    #[test]
+    fn test_subslice_proof_soundness() {
+        let mut rng = thread_rng();
+        let subslice_size = 100;
+
+        // Do setup
+        let (pt, notary_tree) = setup();
+        let user_root = pt.label_tree.root();
+        let notary_root = notary_tree.root();
+
+        // Prove a randomly chosen bit slice
+
+        let bit_idx = rng.gen_range(0..pt.bits.len() - subslice_size);
+        let range = bit_idx..=(bit_idx + subslice_size - 1);
+        let batch_proof = pt.prove_bits(range.clone(), &notary_tree);
+
+        // Verify the batch proof
+        let bits = &pt.bits[range.clone()];
+        verify_bits(&bits, range.clone(), &user_root, &notary_root, &batch_proof).unwrap();
+
+        //
+        // Now modify parts of the proof or plaintext and ensure it fails to verify
+        //
+
+        // Flip a bit in the user label proof
+        let mut bad_proof = batch_proof.clone();
+        bad_proof.active_labels_proof = {
+            let mut buf = bad_proof.active_labels_proof.as_bytes().to_vec();
+            // Flip the lowest bit of the 10th byte
+            buf[10] ^= 1;
+            BatchInclusionProof::from_bytes(buf)
+        };
+        assert!(verify_bits(&bits, range.clone(), &user_root, &notary_root, &bad_proof).is_err());
+
+        // Flip a bit in the notary label proof
+        let mut bad_proof = batch_proof.clone();
+        bad_proof.full_labels_proof = {
+            let mut buf = bad_proof.active_labels_proof.as_bytes().to_vec();
+            // Flip the lowest bit of the 10th byte
+            buf[10] ^= 1;
+            BatchInclusionProof::from_bytes(buf)
+        };
+        assert!(verify_bits(&bits, range.clone(), &user_root, &notary_root, &bad_proof).is_err());
+
+        // Flip a bit of plaintext
+        let mut bad_plaintext = bits.clone().to_vec();
+        bad_plaintext[10] ^= true;
+        assert!(verify_bits(
+            &bad_plaintext,
+            range.clone(),
+            &user_root,
+            &notary_root,
+            &bad_proof
+        )
+        .is_err());
     }
 }

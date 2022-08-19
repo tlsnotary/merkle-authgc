@@ -14,7 +14,7 @@ serde = "1"
 #version = "0.1"
 git = "ssh://git@github.com/rozbb/ct-merkle.git"
 features = ["serde"]
-rev = "a95a54d62a21db0c5a9efa76dabfb5d85eb3fbcd"
+rev = "a800628cce4e6396b5aea23a6a106c0413b225ca"
 
 [dev-dependencies]
 blake2 = "0.10"
