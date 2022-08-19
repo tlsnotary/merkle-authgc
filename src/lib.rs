@@ -1,5 +1,15 @@
+#![no_std]
+
+extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate std;
+
+use alloc::vec::Vec;
+
 use ct_merkle::{
-    batch_inclusion::BatchInclusionProof, CanonicalSerialize, CtMerkleTree, RootHash, SimpleWriter,
+    batch_inclusion::BatchInclusionProof, error::InclusionVerifError, CanonicalSerialize,
+    CtMerkleTree, RootHash, SimpleWriter,
 };
 use digest::Digest;
 use rand_core::{CryptoRng, RngCore};
@@ -150,18 +160,15 @@ pub fn verify_bits<H: Digest>(
     user_root: &UserLabelRoot<H>,
     notary_root: &NotaryLabelRoot<H>,
     proof: &BatchBitProof<H>,
-) -> Result<(), ()> {
+) -> Result<(), InclusionVerifError> {
     let active_idxs: Vec<usize> = range.clone().collect();
 
     // First check the active label's presence in the user label tree
-    user_root
-        .0
-        .verify_batch_inclusion(
-            &proof.active_labels,
-            &active_idxs,
-            &proof.active_labels_proof,
-        )
-        .map_err(|_| ())?;
+    user_root.0.verify_batch_inclusion(
+        &proof.active_labels,
+        &active_idxs,
+        &proof.active_labels_proof,
+    )?;
 
     let active_labels: Vec<Label> = proof.active_labels.iter().map(|lr| lr.label).collect();
     let full_idxs: Vec<usize> = active_idxs
@@ -173,8 +180,7 @@ pub fn verify_bits<H: Digest>(
     // Then check the label's presence in the notary label tree
     notary_root
         .0
-        .verify_batch_inclusion(&active_labels, &full_idxs, &proof.full_labels_proof)
-        .map_err(|_| ())?;
+        .verify_batch_inclusion(&active_labels, &full_idxs, &proof.full_labels_proof)?;
 
     Ok(())
 }
@@ -223,6 +229,21 @@ mod tests {
         (pt, notary_tree)
     }
 
+    // Helper function for doing very basic benchmarks. If the "std" feature is set, this returns
+    // the time it takes to run f(), in microseconds. If "std" is not set, this returns 0.
+    fn timeit_micros<T>(f: impl FnOnce() -> T) -> (T, u128) {
+        #[cfg(feature = "std")]
+        let start = std::time::Instant::now();
+
+        let out = f();
+
+        #[cfg(feature = "std")]
+        return (out, start.elapsed().as_micros());
+
+        #[cfg(not(feature = "std"))]
+        return (out, 0);
+    }
+
     // Checks that an honestly generated proof verifies successfully
     #[test]
     fn test_subslice_proof_correctness() {
@@ -239,42 +260,50 @@ mod tests {
         let bit_idx = rng.gen_range(0..pt.bits.len() - subslice_size);
 
         // Do the proofs naively, one bit at a time
-        let start = std::time::Instant::now();
-        let proofs: Vec<BatchBitProof<H>> = (bit_idx..(bit_idx + subslice_size))
-            .map(|i| pt.prove_bits(i..=i, &notary_tree))
-            .collect();
-        let naive_proof_time = start.elapsed().as_micros();
+        let (proofs, _naive_proof_time) = timeit_micros(|| {
+            (bit_idx..(bit_idx + subslice_size))
+                .map(|i| pt.prove_bits(i..=i, &notary_tree))
+                .collect::<Vec<BatchBitProof<H>>>()
+        });
 
         // Now do batching
         let range = bit_idx..=(bit_idx + subslice_size - 1);
 
         // Do the proofs using batching
-        let start = std::time::Instant::now();
-        let batch_proof = pt.prove_bits(range.clone(), &notary_tree);
-        let batch_proof_time = start.elapsed().as_micros();
+        let (batch_proof, _batch_proof_time) =
+            timeit_micros(|| pt.prove_bits(range.clone(), &notary_tree));
 
         // Verify the naive proofs, one bit at a time
-        let start = std::time::Instant::now();
-        range.clone().zip(proofs.iter()).for_each(|(i, proof)| {
-            verify_bits(&pt.bits[i..=i], i..=i, &user_root, &notary_root, &proof).unwrap()
+        let (_, _naive_verif_time) = timeit_micros(|| {
+            range.clone().zip(proofs.iter()).for_each(|(i, proof)| {
+                verify_bits(&pt.bits[i..=i], i..=i, &user_root, &notary_root, &proof).unwrap()
+            })
         });
-        let naive_verif_time = start.elapsed().as_micros();
 
         // Verify the batch proof
         let bits = &pt.bits[range.clone()];
-        let start = std::time::Instant::now();
-        verify_bits(&bits, range, &user_root, &notary_root, &batch_proof).unwrap();
-        let batch_verif_time = start.elapsed().as_micros();
+        let (_, _batch_verif_time) = timeit_micros(|| {
+            verify_bits(&bits, range, &user_root, &notary_root, &batch_proof).unwrap()
+        });
 
-        println!(
+        #[cfg(feature = "std")]
+        std::println!(
             "Naively revealing {} of 2^{} bits took: {}us / {}us (proof/verif)",
-            subslice_size, LOG_PLAINTEXT_BITLEN, naive_proof_time, naive_verif_time
+            subslice_size,
+            LOG_PLAINTEXT_BITLEN,
+            _naive_proof_time,
+            _naive_verif_time
         );
-        println!(
+        #[cfg(feature = "std")]
+        std::println!(
             "Batched revealing {} of 2^{} bits took: {}us / {}us (proof/verif)",
-            subslice_size, LOG_PLAINTEXT_BITLEN, batch_proof_time, batch_verif_time
+            subslice_size,
+            LOG_PLAINTEXT_BITLEN,
+            _batch_proof_time,
+            _batch_verif_time
         );
-        println!(
+        #[cfg(feature = "std")]
+        std::println!(
             "Proof size is {}B / {}B (naive/batched)",
             2 * proofs.len() * proofs[0].active_labels_proof.as_bytes().len(),
             2 * batch_proof.active_labels_proof.as_bytes().len(),
