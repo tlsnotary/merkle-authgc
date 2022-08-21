@@ -5,6 +5,8 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod gen;
+
 use alloc::vec::Vec;
 
 use ct_merkle::{
@@ -15,7 +17,7 @@ use digest::Digest;
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
-type Label = [u8; 16];
+pub type Label = [u8; 16];
 type Randomness = [u8; 16];
 
 /// Contains a label and a random string used for hiding in the commitment
@@ -28,14 +30,16 @@ struct LabelAndRandomness {
 //The UserLabel of bit `b` at index `i` appears in this data structure at index `2i + b`.
 /// The Merkle tree containing all the Notary's labels.
 #[derive(Clone, SerdeSerialize, SerdeDeserialize)]
-pub struct NotaryLabels<H: Digest>(CtMerkleTree<H, Label>);
+pub struct NotaryLabelTree<H: Digest>(CtMerkleTree<H, Label>);
 /// The Merkle tree containing all the User's labels.
 #[derive(Clone, SerdeSerialize, SerdeDeserialize)]
-pub struct UserLabels<H: Digest>(CtMerkleTree<H, LabelAndRandomness>);
+pub struct UserLabelTree<H: Digest>(CtMerkleTree<H, LabelAndRandomness>);
 
 /// The root hash of the Notary's label tree
+#[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize)]
 pub struct NotaryLabelRoot<H: Digest>(RootHash<H>);
 /// The root hash of the User's label tree
+#[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize)]
 pub struct UserLabelRoot<H: Digest>(RootHash<H>);
 
 /// A batch proof revealing a number of plaintext bits
@@ -55,8 +59,26 @@ pub struct Plaintext<H: Digest> {
     /// The plaintext bitstring
     pub bits: Vec<bool>,
     /// The Merkle tree of the plaintext
-    pub label_tree: UserLabels<H>,
+    pub label_tree: UserLabelTree<H>,
 }
+
+impl<H: Digest> PartialEq for UserLabelRoot<H> {
+    /// Compares this `RootHash` to another in constant time.
+    fn eq(&self, other: &UserLabelRoot<H>) -> bool {
+        self.0.eq(&other.0)
+    }
+}
+
+impl<H: Digest> Eq for UserLabelRoot<H> {}
+
+impl<H: Digest> PartialEq for NotaryLabelRoot<H> {
+    /// Compares this `RootHash` to another in constant time.
+    fn eq(&self, other: &NotaryLabelRoot<H>) -> bool {
+        self.0.eq(&other.0)
+    }
+}
+
+impl<H: Digest> Eq for NotaryLabelRoot<H> {}
 
 impl CanonicalSerialize for LabelAndRandomness {
     fn serialize<W: SimpleWriter>(&self, mut w: W) {
@@ -65,51 +87,55 @@ impl CanonicalSerialize for LabelAndRandomness {
     }
 }
 
-impl<H: Digest> NotaryLabels<H> {
+impl<H: Digest> NotaryLabelTree<H> {
     /// Get the Merkle root of the Notary label tree
     pub fn root(&self) -> NotaryLabelRoot<H> {
         NotaryLabelRoot(self.0.root())
     }
 }
 
-impl<H: Digest> UserLabels<H> {
+impl<H: Digest> UserLabelTree<H> {
     /// Get the Merkle root of the User label tree
     pub fn root(&self) -> UserLabelRoot<H> {
         UserLabelRoot(self.0.root())
     }
 }
 
-/// Commits to the active label set by making a tree out of the (blinded) labels. This is done by
-/// the User before she learns the decoding of her plaintext.
-pub fn user_commit<H, R>(mut rng: R, labels: &[Label]) -> UserLabels<H>
-where
-    R: CryptoRng + RngCore,
-    H: Digest,
-{
-    let mut tree = CtMerkleTree::new();
-    labels.iter().cloned().for_each(|label| {
-        let mut randomness = Randomness::default();
-        rng.fill_bytes(&mut randomness);
+impl<H: Digest> UserLabelTree<H> {
+    /// Commits to the active label set by making a tree out of the (blinded) labels. This is done
+    /// by the User before she learns the decoding of her plaintext.
+    pub fn gen_from_labels<'a, R>(
+        mut rng: R,
+        user_labels: impl IntoIterator<Item = Label>,
+    ) -> UserLabelTree<H>
+    where
+        R: CryptoRng + RngCore,
+        H: Digest,
+    {
+        let mut tree = CtMerkleTree::new();
+        user_labels.into_iter().for_each(|label| {
+            let mut randomness = Randomness::default();
+            rng.fill_bytes(&mut randomness);
 
-        let entry = LabelAndRandomness { label, randomness };
-        tree.push(entry);
-    });
+            let entry = LabelAndRandomness { label, randomness };
+            tree.push(entry);
+        });
 
-    UserLabels(tree)
+        UserLabelTree(tree)
+    }
 }
 
-/// Commits to the full label set by making a tree out of the  labels. The labels must be ordered
-/// as `[label1bit0, label1bit1, label2bit0, label2bit1, ...]`
-pub fn notary_commit<H>(labels: &[Label]) -> NotaryLabels<H>
-where
-    H: Digest,
-{
-    let mut tree = CtMerkleTree::new();
-    labels.iter().cloned().for_each(|label| {
-        tree.push(label);
-    });
+impl<H: Digest> NotaryLabelTree<H> {
+    /// Constructs a tree from the full label set. The labels must be ordered as `[label1bit0,
+    /// label1bit1, label2bit0, label2bit1, ...]`
+    pub fn from_labels(notary_labels: impl IntoIterator<Item = Label>) -> NotaryLabelTree<H> {
+        let mut tree = CtMerkleTree::new();
+        notary_labels.into_iter().for_each(|label| {
+            tree.push(label);
+        });
 
-    NotaryLabels(tree)
+        NotaryLabelTree(tree)
+    }
 }
 
 impl<H: Digest> Plaintext<H> {
@@ -119,7 +145,7 @@ impl<H: Digest> Plaintext<H> {
     pub fn prove_bits(
         &self,
         range: core::ops::RangeInclusive<usize>,
-        all_labels: &NotaryLabels<H>,
+        all_labels: &NotaryLabelTree<H>,
     ) -> BatchBitProof<H> {
         let active_idxs: Vec<usize> = range.clone().collect();
         let bits = self.bits[range.clone()].to_vec();
@@ -170,7 +196,12 @@ pub fn verify_bits<H: Digest>(
         &proof.active_labels_proof,
     )?;
 
+    // Extract just the label (not the randomness) from the user's label tree. This is used for
+    // verification of the Notary batch inclusion proof
     let active_labels: Vec<Label> = proof.active_labels.iter().map(|lr| lr.label).collect();
+
+    // Get the corresponding indices into the full label set. Recall label i bit b occurs in
+    // the full set at index 2i + b
     let full_idxs: Vec<usize> = active_idxs
         .iter()
         .zip(bits.iter())
@@ -196,7 +227,7 @@ mod tests {
     const LOG_PLAINTEXT_BITLEN: usize = 15;
     const PLAINTEXT_BITLEN: usize = 1 << LOG_PLAINTEXT_BITLEN;
 
-    fn setup() -> (Plaintext<H>, NotaryLabels<H>) {
+    fn setup() -> (Plaintext<H>, NotaryLabelTree<H>) {
         let mut rng = thread_rng();
 
         // Generate random labels
@@ -218,8 +249,8 @@ mod tests {
             .collect();
 
         // Commit to everything
-        let user_tree = user_commit::<H, _>(&mut rng, &plaintext_labels);
-        let notary_tree = notary_commit::<H>(&all_labels);
+        let user_tree = UserLabelTree::gen_from_labels(&mut rng, plaintext_labels);
+        let notary_tree = NotaryLabelTree::from_labels(all_labels);
 
         let pt = Plaintext {
             label_tree: user_tree,
