@@ -19,7 +19,7 @@ std = ["ct-merkle/std"]
 #version = "0.1"
 git = "ssh://git@github.com/rozbb/ct-merkle.git"
 features = ["serde"]
-rev = "a800628cce4e6396b5aea23a6a106c0413b225ca"
+rev = "c13f2e472cb9c037e7184063619fdaf9b5a2c36b"
 
 [dev-dependencies]
 blake2 = "0.10"
